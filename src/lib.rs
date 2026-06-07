@@ -1,5 +1,5 @@
 //! APEX Fusion - RTK + CBM + Headroom + Caveman 四合一压缩引擎
-//! 
+//!
 //! 融合来源：
 //! - RTK (signal1project/rtk) - 截断/去重/跨轮dedup
 //! - CBM - Context Boundary Marker 防越界标记
@@ -24,13 +24,9 @@ pub use caveman::compress_text;
 /// 融合压缩配置
 #[derive(Debug, Clone)]
 pub struct FusionConfig {
-    /// RTK截断配置
     pub rtk: RtkConfig,
-    /// 是否启用CBM标记
     pub enable_cbm: bool,
-    /// 是否启用SmartCrusher
     pub enable_smart_crusher: bool,
-    /// 是否启用Caveman语法剥离
     pub enable_caveman: bool,
 }
 
@@ -70,7 +66,6 @@ impl Default for RtkConfig {
     }
 }
 
-/// 融合压缩结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionResult {
     pub original_len: usize,
@@ -99,7 +94,6 @@ impl CompressionResult {
     }
 }
 
-/// 主融合压缩函数
 pub fn fuse_compress(
     content: &str,
     tool_type: &str,
@@ -111,7 +105,6 @@ pub fn fuse_compress(
     let mut layers: Vec<&str> = Vec::new();
     let mut current = content.to_string();
 
-    // Layer 1: RTK 截断+去重
     current = match tool_type {
         "Read" => {
             if let Some(path) = file_path {
@@ -130,7 +123,6 @@ pub fn fuse_compress(
         layers.push("RTK");
     }
 
-    // Layer 2: CBM 边界标记（仅对文本内容）
     if config.enable_cbm && !current.is_empty() {
         let with_markers = cbm::insert_markers(&current, tool_type);
         if with_markers != current {
@@ -139,7 +131,6 @@ pub fn fuse_compress(
         }
     }
 
-    // Layer 3: SmartCrusher JSON压缩
     if config.enable_smart_crusher && current.len() > 500 {
         if let Some(json_compressed) = smart_crusher::try_compress_json(&current) {
             if json_compressed.len() < current.len() {
@@ -149,7 +140,6 @@ pub fn fuse_compress(
         }
     }
 
-    // Layer 4: Caveman 语法剥离（仅对长文本）
     if config.enable_caveman && current.len() > 200 {
         let caveman_compressed = caveman::compress(&current);
         if caveman_compressed.len() < current.len() {
@@ -161,7 +151,6 @@ pub fn fuse_compress(
     CompressionResult::new(original, current, layers)
 }
 
-/// 跨轮去重状态
 pub struct SessionState {
     pub reads: HashMap<String, ReadState>,
     pub turn: u32,
@@ -175,57 +164,38 @@ pub struct ReadState {
 
 impl SessionState {
     pub fn new() -> Self {
-        Self {
-            reads: HashMap::new(),
-            turn: 0,
-        }
+        Self { reads: HashMap::new(), turn: 0 }
     }
-
-    pub fn increment_turn(&mut self) {
-        self.turn += 1;
-    }
-
+    pub fn increment_turn(&mut self) { self.turn += 1; }
     pub fn check_read(&self, session_id: &str, file_path: &str) -> Option<String> {
         let key = format!("{}:{}", session_id, file_path);
         self.reads.get(&key).map(|s| format!("turn {}", s.turn))
     }
-
     pub fn update_read(&mut self, session_id: &str, file_path: &str, content: &str) {
         let key = format!("{}:{}", session_id, file_path);
         let hash = format!("{:x}", md5::compute(content.as_bytes()));
-        self.reads.insert(key, ReadState {
-            hash,
-            turn: self.turn,
-        });
+        self.reads.insert(key, ReadState { hash, turn: self.turn });
     }
 }
 
 impl Default for SessionState {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rtk_bash_dedup() {
+    #[test] fn test_rtk_bash_dedup() {
         let output = "line1\nline1\nline1\nline2\nline3";
         let compressed = rtk::compress_bash_internal(output, 150, 80, 50);
         assert!(compressed.contains("[RTK:"));
     }
-
-    #[test]
-    fn test_caveman_compression() {
+    #[test] fn test_caveman_compression() {
         let text = "The system is designed to optimize database performance by implementing efficient indexing strategies.";
         let compressed = caveman::compress(text);
         assert!(compressed.len() < text.len());
     }
-
-    #[test]
-    fn test_smart_crusher_json() {
+    #[test] fn test_smart_crusher_json() {
         let json = r#"{"items": [{"id": 1, "name": "test"}, {"id": 2, "name": "test"}]}"#;
         if let Some(compressed) = smart_crusher::try_compress_json(json) {
             assert!(compressed.contains("2x"));

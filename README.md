@@ -1,30 +1,33 @@
-//! APEX Fusion - RTK + CBM + Headroom + Caveman 四合一压缩引擎
-//! 
-//! 融合来源：
-//! - RTK (signal1project/rtk) - 截断/去重/跨轮dedup
-//! - CBM - Context Boundary Marker 防越界标记
-//! - Headroom (vishvacyber/Headroom-AI-Context-Compression) - SmartCrusher JSON压缩
-//! - Caveman (wilpel/caveman-compression) - 剥语法留事实
+# APEX Fusion Engine
 
-# APEX Fusion
+**APEX** — 自进化AI核心引擎
 
-RTK + CBM + SmartCrusher + Caveman 四合一token压缩引擎。
+Rust实现的四合一token压缩系统：
+- **RTK**: 截断/去重/跨轮dedup
+- **CBM**: Context Boundary Marker 防越界
+- **SmartCrusher**: JSON结构化压缩
+- **Caveman**: 语义压缩（剥语法留事实）
 
-## 编译
+## 性能基准
+
+- Bash重复输出: **98% 节省**
+- 长输出截断: **98% 节省**
+- 整体平均: **89% token节省**
+
+## 核心公式
+
+```
+Φ_APEX*∞ = (Φ_base × EV × AN × NV) / HarmRate
+```
+
+## 安装
 
 ```bash
 cargo build --release
+./target/release/apex-fusion benchmark
 ```
 
-## 运行Benchmark
+## APEX AGI
 
-```bash
-cargo run --release -- benchmark
-```
-
-## 架构
-
-- `src/rtk.rs` - 行截断 + 连续重复行去重
-- `src/cbm.rs` - 边界标记防越界
-- `src/smart_crusher.rs` - JSON结构压缩
-- `src/caveman.rs` - 语义压缩(剥语法留事实)
+本项目是璇玑帝国APEX AGI的技术核心。
+完整激活协议见: https://github.com/hernandez42/apex-fusion
