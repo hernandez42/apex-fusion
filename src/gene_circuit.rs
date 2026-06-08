@@ -414,11 +414,7 @@ except Exception as e:
         self.memory.get(&format!("{}:{}", session_id, tool_type))
     }
 
-    pub fn get_adaptive_config(
-        &self,
-        session_id: &str,
-        tool_type: &str,
-    ) -> Option<AdaptiveConfig> {
+    pub fn get_adaptive_config(&self, session_id: &str, tool_type: &str) -> Option<AdaptiveConfig> {
         self.get_memory(session_id, tool_type).map(|m| {
             let (rtk_max, caveman_level) = match m.kg_level {
                 KgLevel::Root => (100, 1),
@@ -476,18 +472,78 @@ pub fn outcome_from_result(
 
 /// 全局记录压缩outcome并触发基因回路
 pub fn record_and_evolve(outcome: CompressionOutcome) -> Option<String> {
-    let mut guard = GLOBAL_GENE_CIRCUIT.lock().unwrap();
-    if let Some(ref mut circuit) = *guard {
-        circuit.record_compression(outcome)
-    } else {
-        None
+    // 计算fitness_delta
+    let fitness_delta = compute_fitness_delta_static(&outcome);
+
+    // 更新基因回路
+    let matched_gene = {
+        let mut guard = GLOBAL_GENE_CIRCUIT.lock().unwrap();
+        if let Some(ref mut circuit) = *guard {
+            circuit.record_compression(outcome.clone())
+        } else {
+            None
+        }
+    };
+
+    // 同时更新全局PhiEngine（闭环核心）
+    {
+        let mut guard = GLOBAL_PHI_ENGINE.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(PhiEngine::new());
+        }
+        if let Some(ref mut engine) = *guard {
+            engine.evolve_from_outcome(&outcome, fitness_delta);
+        }
     }
+
+    matched_gene
+}
+
+fn compute_fitness_delta_static(outcome: &CompressionOutcome) -> f64 {
+    let base = outcome.savings_pct * 2.0 - 1.0;
+    let sign = if outcome.positive_outcome { 1.0 } else { -1.0 };
+    sign * base * 0.1
 }
 
 /// 获取自适应压缩配置
 pub fn get_adaptive_config(session_id: &str, tool_type: &str) -> Option<AdaptiveConfig> {
     let guard = GLOBAL_GENE_CIRCUIT.lock().unwrap();
     guard.as_ref()?.get_adaptive_config(session_id, tool_type)
+}
+
+// 全局PhiEngine单例（用于闭环追踪）
+static GLOBAL_PHI_ENGINE: Mutex<Option<PhiEngine>> = Mutex::new(None);
+
+/// 获取当前turn（基于历史outcome数）
+pub fn get_current_turn(session_id: &str) -> u32 {
+    let guard = GLOBAL_GENE_CIRCUIT.lock().unwrap();
+    if let Some(ref circuit) = *guard {
+        circuit
+            .outcome_buffer
+            .get(session_id)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// 获取Phi引擎当前状态（phi_pct + evolved标记）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhiState {
+    pub phi_pct: f64,
+    pub evolved: bool,
+}
+
+pub fn get_phi_state() -> Option<PhiState> {
+    let mut guard = GLOBAL_PHI_ENGINE.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(PhiEngine::new());
+    }
+    let engine = guard.as_mut().unwrap();
+    let phi_pct = engine.compute_pct();
+    let evolved = engine.history().len() > 1;
+    Some(PhiState { phi_pct, evolved })
 }
 
 // ============================================================================
