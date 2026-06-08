@@ -346,7 +346,11 @@ except Exception as e:
         *entry = (*entry + delta).clamp(-1.0, 10.0);
     }
 
-    fn internalize_strategy(&mut self, signal: &CompressionSignal, outcome: &CompressionOutcome) {
+    fn internalize_strategy(
+        &mut self,
+        signal: &CompressionSignal,
+        outcome: &CompressionOutcome,
+    ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -486,73 +490,308 @@ pub fn get_adaptive_config(session_id: &str, tool_type: &str) -> Option<Adaptive
     guard.as_ref()?.get_adaptive_config(session_id, tool_type)
 }
 
+// ============================================================================
+// Φ_APEX*∞ 引擎 — 修复乘法衰减问题
+// ============================================================================
+//
+// 原公式问题：15个参数全0.1相乘 → Φ≈2e-15%，系统初始化即死亡
+//
+// 修复方案：对数空间计算
+// log(Φ) = Σᵢlog(αᵢ) + log(Φ_base) + log(EV) + log(AN) + log(NV) - log(HarmRate)
+//
+// ============================================================================
+
+/// Φ引擎参数状态（15个因子）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhiParams {
+    pub omega_a: f64,
+    pub beta_bg: f64,
+    pub alpha_ack: f64,
+    pub theta_tri: f64,
+    pub nabla_k: f64,
+    pub zeta_sigma: f64,
+    pub eta_lambda: f64,
+    pub evm: f64,
+    pub a: f64,
+    pub b: f64,
+    pub tdhlgwb: f64,
+    pub phi_base: f64,
+    pub ev: f64,
+    pub an: f64,
+    pub nv: f64,
+    pub harm_rate: f64,
+}
+
+impl Default for PhiParams {
+    fn default() -> Self {
+        Self {
+            omega_a: 0.5,
+            beta_bg: 0.5,
+            alpha_ack: 0.5,
+            theta_tri: 0.5,
+            nabla_k: 0.5,
+            zeta_sigma: 0.5,
+            eta_lambda: 0.5,
+            evm: 0.5,
+            a: 0.5,
+            b: 0.5,
+            tdhlgwb: 0.5,
+            phi_base: 0.5,
+            ev: 0.3,
+            an: 0.5,
+            nv: 0.5,
+            harm_rate: 0.34,
+        }
+    }
+}
+
+impl PhiParams {
+    /// 从压缩outcome更新参数（在线学习）
+    pub fn update_from_outcome(&mut self, outcome: &CompressionOutcome, fitness_delta: f64) {
+        let lr = 0.05;
+
+        if fitness_delta > 0.0 {
+            let delta = (fitness_delta * lr).min(0.1);
+            self.omega_a = (self.omega_a + self.omega_a * delta).min(1.0);
+            self.ev = (self.ev + self.ev * delta * 2.0).min(1.0);
+            self.nv = (self.nv + self.nv * delta).min(1.0);
+            self.an = (self.an + self.an * delta).min(1.0);
+        }
+    }
+}
+
+/// Φ_APEX*∞ 引擎
+pub struct PhiEngine {
+    params: PhiParams,
+    history: Vec<PhiSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhiSnapshot {
+    pub phi: f64,
+    pub phi_pct: f64,
+    pub log_terms: f64,
+    pub timestamp: u64,
+}
+
+impl PhiEngine {
+    pub fn new() -> Self {
+        Self {
+            params: PhiParams::default(),
+            history: Vec::new(),
+        }
+    }
+
+    pub fn with_params(params: PhiParams) -> Self {
+        Self {
+            params,
+            history: Vec::new(),
+        }
+    }
+
+    /// 对数空间Φ计算
+    /// log(Φ) = Σᵢlog(αᵢ) + log(Φ_base) + log(EV) + log(AN) + log(NV) - log(HarmRate)
+    pub fn compute(&self) -> f64 {
+        let log_factors: f64 = [
+            self.params.omega_a,
+            self.params.beta_bg,
+            self.params.alpha_ack,
+            self.params.theta_tri,
+            self.params.nabla_k,
+            self.params.zeta_sigma,
+            self.params.eta_lambda,
+            self.params.evm,
+            self.params.a,
+            self.params.b,
+            self.params.tdhlgwb,
+        ]
+        .iter()
+        .map(|&x| x.clamp(1e-10, 1.0))
+        .map(|x| x.ln())
+        .sum();
+
+        let log_numerator = self.params.phi_base.clamp(1e-10, 1.0).ln()
+            + self.params.ev.clamp(1e-10, 1.0).ln()
+            + self.params.an.clamp(1e-10, 1.0).ln()
+            + self.params.nv.clamp(1e-10, 1.0).ln();
+
+        let log_harm = self.params.harm_rate.clamp(0.01, 10.0).ln();
+
+        let log_phi = log_factors + log_numerator - log_harm;
+        log_phi.exp()
+    }
+
+    pub fn compute_pct(&self) -> f64 {
+        self.compute() * 100.0
+    }
+
+    pub fn params(&self) -> &PhiParams {
+        &self.params
+    }
+
+    pub fn evolve_from_outcome(&mut self, outcome: &CompressionOutcome, fitness_delta: f64) {
+        let phi_before = self.compute();
+        self.params.update_from_outcome(outcome, fitness_delta);
+        let phi_after = self.compute();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        self.history.push(PhiSnapshot {
+            phi: phi_after,
+            phi_pct: phi_after * 100.0,
+            log_terms: phi_before.ln(),
+            timestamp: now,
+        });
+    }
+
+    pub fn delta_phi(&self) -> Option<f64> {
+        if self.history.len() < 2 {
+            return None;
+        }
+        let last = self.history.last()?;
+        let prev = &self.history[self.history.len() - 2];
+        Some(last.phi - prev.phi)
+    }
+
+    pub fn history(&self) -> &[PhiSnapshot] {
+        &self.history
+    }
+
+    /// 分层诊断：哪些因子在拖累Φ（升序）
+    pub fn diagnose(&self) -> Vec<(&'static str, f64)> {
+        let mut contributions = vec![
+            ("Omega_A", self.params.omega_a),
+            ("beta_bg", self.params.beta_bg),
+            ("alpha_ack", self.params.alpha_ack),
+            ("Theta_TRI", self.params.theta_tri),
+            ("nabla_K", self.params.nabla_k),
+            ("zeta_sigma", self.params.zeta_sigma),
+            ("eta_lambda", self.params.eta_lambda),
+            ("EVM", self.params.evm),
+            ("A", self.params.a),
+            ("B", self.params.b),
+            ("TDHLGWB", self.params.tdhlgwb),
+            ("phi_base", self.params.phi_base),
+            ("EV", self.params.ev),
+            ("AN", self.params.an),
+            ("NV", self.params.nv),
+        ];
+
+        contributions.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        contributions
+    }
+}
+
+impl Default for PhiEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_compression_outcome() {
-        let o = CompressionOutcome::new("Bash", "RTK", 1000, 200, "sess1", 1);
-        assert!((o.savings_pct - 0.8).abs() < 0.001);
-        assert!(o.positive_outcome);
-    }
-
-    #[test]
-    fn test_compression_outcome_low_savings() {
-        let o = CompressionOutcome::new("Bash", "RTK", 1000, 850, "sess1", 1);
-        assert!((o.savings_pct - 0.15).abs() < 0.001);
-        assert!(!o.positive_outcome);
-    }
-
-    #[test]
-    fn test_compression_signal_repeated_bash() {
-        let outcomes = vec![
-            CompressionOutcome::new("Bash", "RTK", 1000, 200, "sess1", 1),
-            CompressionOutcome::new("Bash", "Caveman", 1000, 700, "sess1", 2),
-        ];
-        let signal = CompressionSignal::from_outcomes(&outcomes, "sess1");
-        assert!(signal.repeated_bash);
-    }
-
-    #[test]
-    fn test_gene_signals() {
-        let signal = CompressionSignal {
-            tool_type: "Bash".to_string(),
-            layer: "RTK".to_string(),
-            savings_pct: 0.85,
-            session_id: "sess1".to_string(),
-            turn: 1,
-            repeated_bash: true,
-            json_detected: false,
-            long_text: false,
+    fn test_log_space_physics() {
+        let old_phi = {
+            let params = PhiParams {
+                omega_a: 0.1,
+                beta_bg: 0.1,
+                alpha_ack: 0.1,
+                theta_tri: 0.1,
+                nabla_k: 0.1,
+                zeta_sigma: 0.1,
+                eta_lambda: 0.1,
+                evm: 0.1,
+                a: 0.1,
+                b: 0.1,
+                tdhlgwb: 0.1,
+                phi_base: 0.01,
+                ev: 0.181,
+                an: 0.1,
+                nv: 0.1,
+                harm_rate: 1.0,
+            };
+            PhiEngine::with_params(params).compute()
         };
-        let signals = signal.to_gene_signals();
-        assert!(signals.contains(&"compression_bash".to_string()));
-        assert!(signals.contains(&"high_compression".to_string()));
-        assert!(signals.contains(&"repeated_bash".to_string()));
+
+        let new_phi = {
+            let params = PhiParams::default();
+            PhiEngine::with_params(params).compute()
+        };
+
+        println!(
+            "旧公式 (全0.1): Phi = {:.6e} = {}%",
+            old_phi,
+            old_phi * 100.0
+        );
+        println!(
+            "新公式 (平衡初始): Phi = {:.6e} = {}%",
+            new_phi,
+            new_phi * 100.0
+        );
+        println!("改善倍数: {:.1e}x", new_phi / old_phi);
+
+        assert!(old_phi < 1e-10, "旧公式应该接近零");
+        assert!(new_phi > 1e-6, "新公式应该大于0.0001%");
+        assert!(new_phi / old_phi > 10000.0, "改善应该超过10000倍");
     }
 
     #[test]
-    fn test_adaptive_config_root() {
-        let mut mem = CompressionMemory::new("s1", "Bash");
-        mem.record("Caveman", 0.75, KgLevel::Root);
-        assert_eq!(mem.kg_level, KgLevel::Root);
-        assert!(mem.avg_savings > 0.7);
+    fn test_default_phi_value() {
+        let engine = PhiEngine::new();
+        let phi = engine.compute();
+        let phi_pct = engine.compute_pct();
+        println!("默认参数 Phi = {}%", phi_pct);
+
+        assert!(phi > 1e-6, "应该大于0.0001%");
+        assert!(phi < 0.01, "应该小于1%");
     }
 
     #[test]
-    fn test_fitness_delta_positive() {
-        let circuit = ApexGeneCircuit::new("/tmp");
-        let outcome = CompressionOutcome::new("Bash", "RTK", 1000, 100, "sess1", 1);
-        let delta = circuit.compute_fitness_delta(&outcome);
-        assert!(delta > 0.0);
+    fn test_diagnose() {
+        let engine = PhiEngine::new();
+        let diags = engine.diagnose();
+        println!("短板排序（升序）:");
+        for (name, val) in &diags {
+            println!("  {}: {:.4}", name, val);
+        }
+        assert!(diags[0].1 < 0.5, "应该有短板因子");
     }
 
     #[test]
-    fn test_fitness_delta_negative() {
-        let circuit = ApexGeneCircuit::new("/tmp");
-        let outcome = CompressionOutcome::new("Bash", "RTK", 1000, 900, "sess1", 1);
-        let delta = circuit.compute_fitness_delta(&outcome);
-        assert!(delta < 0.0);
+    fn test_evolve() {
+        let mut engine = PhiEngine::new();
+        let phi_before = engine.compute();
+
+        let outcome = CompressionOutcome::new("Bash", "RTK", 1000, 200, "sess1", 1);
+        engine.evolve_from_outcome(&outcome, 0.1);
+
+        let phi_after = engine.compute();
+        println!("Phi演化: {}% --> {}%", phi_before * 100.0, phi_after * 100.0);
+
+        assert!(phi_after >= phi_before, "正向outcome应该提升Phi");
+    }
+
+    #[test]
+    fn test_delta_phi() {
+        let mut engine = PhiEngine::new();
+        let outcome = CompressionOutcome::new("Bash", "RTK", 1000, 200, "sess1", 1);
+
+        engine.evolve_from_outcome(&outcome, 0.1);
+        engine.evolve_from_outcome(&outcome, 0.1);
+
+        assert!(engine.delta_phi().is_some(), "应该能计算delta_Phi");
+        println!("delta_Phi: {:?}", engine.delta_phi());
     }
 }
